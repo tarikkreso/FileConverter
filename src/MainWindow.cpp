@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "ContextMenu.h"
+#include "PreferencesDialog.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -11,29 +12,74 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QDir>
+#include <QStandardPaths>
+#include <QPalette>
+#include <QSettings>
+#include <QKeySequence>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), totalFiles(0), processedFiles(0)
 {
+    // Set default output directory to user's Documents; may be overridden by loadSettings()
+    // below if the user has opted to remember their last-used folder.
+    outputDirectory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FileConverter_Output";
+    loadSettings();
+
     setupUI();
-    
+
     // Create converter
     converter = new Converter(this);
+    converter->setJpgQuality(jpgQuality);
+    converter->setMaxParallelConversions(maxParallelConversions);
     connect(converter, &Converter::conversionStarted, this, &MainWindow::onConversionStarted);
     connect(converter, &Converter::conversionFinished, this, &MainWindow::onConversionFinished);
     connect(converter, &Converter::conversionError, this, &MainWindow::onConversionError);
     connect(converter, &Converter::allConversionsFinished, this, &MainWindow::onAllConversionsFinished);
-    
+
     // Progress timer for time estimates
     progressTimer = new QTimer(this);
     connect(progressTimer, &QTimer::timeout, this, &MainWindow::updateProgressTimer);
-    
-    // Set default output directory to user's Documents
-    outputDirectory = QDir::homePath() + "/Documents/FileConverter_Output";
 }
 
 MainWindow::~MainWindow()
 {
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    saveSettings();
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::loadSettings()
+{
+    QSettings settings;
+    if (settings.contains("window/geometry")) {
+        restoreGeometry(settings.value("window/geometry").toByteArray());
+    }
+
+    rememberOutputDirectory = settings.value("output/rememberLastFolder", false).toBool();
+    if (rememberOutputDirectory) {
+        QString savedDir = settings.value("output/directory").toString();
+        if (!savedDir.isEmpty()) {
+            outputDirectory = savedDir;
+        }
+    }
+
+    jpgQuality = settings.value("conversion/jpgQuality", 90).toInt();
+    maxParallelConversions = settings.value("conversion/maxParallel", 1).toInt();
+}
+
+void MainWindow::saveSettings()
+{
+    QSettings settings;
+    settings.setValue("window/geometry", saveGeometry());
+    settings.setValue("output/rememberLastFolder", rememberOutputDirectory);
+    if (rememberOutputDirectory) {
+        settings.setValue("output/directory", outputDirectory);
+    }
+    settings.setValue("conversion/jpgQuality", jpgQuality);
+    settings.setValue("conversion/maxParallel", maxParallelConversions);
 }
 
 void MainWindow::addFiles(const QStringList &filePaths)
@@ -76,6 +122,8 @@ void MainWindow::setupUI()
     fileListTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     fileListTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     fileListTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    fileListTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(fileListTable, &QTableWidget::customContextMenuRequested, this, &MainWindow::showFileListContextMenu);
     fileListLayout->addWidget(fileListTable);
 
     mainLayout->addWidget(fileListGroup);
@@ -112,13 +160,11 @@ void MainWindow::setupUI()
     controlLayout->addWidget(formatSelector);
 
     convertButton = new QPushButton("Convert All", this);
-    convertButton->setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 20px; }"
-                                 "QPushButton:disabled { background-color: #cccccc; color: #666666; }");
+    convertButton->setDefault(true);
     connect(convertButton, &QPushButton::clicked, this, &MainWindow::onConvertClicked);
     controlLayout->addWidget(convertButton);
 
     cancelButton = new QPushButton("Cancel", this);
-    cancelButton->setStyleSheet("QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 8px 20px; }");
     cancelButton->setVisible(false);
     connect(cancelButton, &QPushButton::clicked, this, &MainWindow::onCancelClicked);
     controlLayout->addWidget(cancelButton);
@@ -131,8 +177,8 @@ void MainWindow::setupUI()
     outputLayout->addWidget(outputLabel);
     
     outputDirLabel = new QLabel(this);
-    outputDirLabel->setStyleSheet("QLabel { color: #555; }");
-    outputDirLabel->setText(QDir::homePath() + "/Documents/FileConverter_Output");
+    outputDirLabel->setForegroundRole(QPalette::PlaceholderText);
+    outputDirLabel->setText(outputDirectory);
     outputDirLabel->setWordWrap(true);
     outputLayout->addWidget(outputDirLabel, 1);
     
@@ -159,7 +205,7 @@ void MainWindow::setupUI()
     progressLayout->addWidget(progressBar, 1);
     
     timeLabel = new QLabel("", this);
-    timeLabel->setStyleSheet("QLabel { color: #666; font-size: 11px; }");
+    timeLabel->setForegroundRole(QPalette::PlaceholderText);
     timeLabel->setVisible(false);
     progressLayout->addWidget(timeLabel);
 
@@ -190,9 +236,12 @@ void MainWindow::onAddFilesClicked()
 
 void MainWindow::addFilesToList(const QStringList &filePaths)
 {
+    int duplicateCount = 0;
+
     for (const QString &filePath : filePaths) {
         // Check if file already exists
         if (findFileRow(filePath) != -1) {
+            duplicateCount++;
             continue;
         }
 
@@ -202,14 +251,43 @@ void MainWindow::addFilesToList(const QStringList &filePaths)
 
         fileListTable->setItem(row, 0, new QTableWidgetItem(fileInfo.fileName()));
         fileListTable->setItem(row, 1, new QTableWidgetItem(filePath));
-        
+
         Converter::FileFormat format = Converter::detectFormat(filePath);
         fileListTable->setItem(row, 2, new QTableWidgetItem(Converter::formatToString(format)));
         fileListTable->setItem(row, 3, new QTableWidgetItem("Pending"));
     }
 
-    statusBar()->showMessage(QString("%1 file(s) ready").arg(fileListTable->rowCount()));
+    QString message = QString("%1 file(s) ready").arg(fileListTable->rowCount());
+    if (duplicateCount > 0) {
+        message += QString(" (%1 duplicate(s) skipped)").arg(duplicateCount);
+    }
+    statusBar()->showMessage(message);
     updateConvertButtonState();
+}
+
+void MainWindow::showFileListContextMenu(const QPoint &pos)
+{
+    int row = fileListTable->rowAt(pos.y());
+    if (row < 0) {
+        return;
+    }
+
+    QString status = fileListTable->item(row, 3)->text();
+    bool canRetry = status.contains("Failed") || status.contains("Error");
+
+    QMenu menu(this);
+    QAction *retryAction = menu.addAction("Retry");
+    retryAction->setEnabled(canRetry);
+    menu.addSeparator();
+    QAction *removeAction = menu.addAction("Remove");
+
+    QAction *chosen = menu.exec(fileListTable->viewport()->mapToGlobal(pos));
+    if (chosen == retryAction) {
+        retryRow(row);
+    } else if (chosen == removeAction) {
+        fileListTable->removeRow(row);
+        updateConvertButtonState();
+    }
 }
 
 int MainWindow::findFileRow(const QString &filePath)
@@ -263,19 +341,32 @@ void MainWindow::onConvertClicked()
     }
     outputDirectory = dir;
     outputDirLabel->setText(dir);
-    
+
     // Create output directory if it doesn't exist
     QDir().mkpath(outputDirectory);
-    
-    // Set output directory on converter
     converter->setOutputDirectory(outputDirectory);
 
     Converter::FileFormat targetFormat = static_cast<Converter::FileFormat>(
         formatSelector->currentData().toInt()
     );
 
-    totalFiles = fileListTable->rowCount();
+    QStringList filePaths;
+    for (int i = 0; i < fileListTable->rowCount(); ++i) {
+        filePaths << fileListTable->item(i, 1)->text();
+        fileListTable->item(i, 3)->setText("Queued");
+    }
+
+    startConversionBatch(filePaths, targetFormat);
+}
+
+void MainWindow::startConversionBatch(const QStringList &filePaths, Converter::FileFormat targetFormat)
+{
+    totalFiles = filePaths.size();
     processedFiles = 0;
+    successCount = 0;
+    failedCount = 0;
+    unsupportedCount = 0;
+    cancelledCount = 0;
     lastOutputPath = outputDirectory;
 
     progressBar->setMaximum(totalFiles);
@@ -297,11 +388,27 @@ void MainWindow::onConvertClicked()
     progressTimer->start(500); // Update every 500ms
 
     // Queue all files for conversion (converter handles parallel execution)
-    for (int i = 0; i < fileListTable->rowCount(); ++i) {
-        QString filePath = fileListTable->item(i, 1)->text();
-        fileListTable->item(i, 3)->setText("Queued");
+    for (const QString &filePath : filePaths) {
         converter->convertFile(filePath, targetFormat);
     }
+}
+
+void MainWindow::retryRow(int row)
+{
+    if (row < 0 || row >= fileListTable->rowCount()) {
+        return;
+    }
+
+    QString filePath = fileListTable->item(row, 1)->text();
+    Converter::FileFormat targetFormat = static_cast<Converter::FileFormat>(
+        formatSelector->currentData().toInt()
+    );
+
+    QDir().mkpath(outputDirectory);
+    converter->setOutputDirectory(outputDirectory);
+
+    fileListTable->item(row, 3)->setText("Queued");
+    startConversionBatch(QStringList() << filePath, targetFormat);
 }
 
 void MainWindow::onConversionStarted(const QString &filePath)
@@ -320,32 +427,41 @@ void MainWindow::onConversionFinished(const QString &filePath, Converter::Conver
         switch (status) {
             case Converter::ConversionStatus::Success:
                 fileListTable->item(row, 3)->setText("✓ Success");
+                successCount++;
                 if (!outputPath.isEmpty()) {
                     lastOutputPath = QFileInfo(outputPath).absolutePath();
                 }
                 break;
             case Converter::ConversionStatus::Failed:
                 fileListTable->item(row, 3)->setText("✗ Failed");
+                failedCount++;
                 break;
             case Converter::ConversionStatus::Unsupported:
                 fileListTable->item(row, 3)->setText("⚠ Unsupported");
+                unsupportedCount++;
                 break;
             case Converter::ConversionStatus::Cancelled:
                 fileListTable->item(row, 3)->setText("⊘ Cancelled");
+                cancelledCount++;
                 break;
         }
     }
 
+    updateProgressAfterItem();
+}
+
+void MainWindow::updateProgressAfterItem()
+{
     processedFiles++;
     progressBar->setValue(processedFiles);
-    
+
     // Update progress with time estimate
     qint64 elapsed = elapsedTimer.elapsed();
     if (processedFiles > 0) {
         qint64 avgTimePerFile = elapsed / processedFiles;
         qint64 remainingFiles = totalFiles - processedFiles;
         qint64 estimatedRemaining = avgTimePerFile * remainingFiles;
-        
+
         statusLabel->setText(QString("Converting: %1/%2 files").arg(processedFiles).arg(totalFiles));
         timeLabel->setText(QString("Elapsed: %1 | Remaining: ~%2")
                           .arg(formatElapsedTime(elapsed))
@@ -399,18 +515,28 @@ void MainWindow::onAllConversionsFinished()
     formatSelector->setEnabled(true);
     browseOutputButton->setEnabled(true);
     
-    // Ask user if they want to open the output folder
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        this, 
-        "Conversion Complete",
-        QString("Successfully converted %1 files.\n\nWould you like to open the output folder?").arg(processedFiles),
-        QMessageBox::Yes | QMessageBox::No
-    );
-    
-    if (reply == QMessageBox::Yes) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputPath));
+    QStringList parts;
+    if (successCount > 0) parts << QString("%1 succeeded").arg(successCount);
+    if (failedCount > 0) parts << QString("%1 failed").arg(failedCount);
+    if (unsupportedCount > 0) parts << QString("%1 unsupported").arg(unsupportedCount);
+    if (cancelledCount > 0) parts << QString("%1 cancelled").arg(cancelledCount);
+    QString summary = parts.isEmpty() ? "No files were processed." : parts.join(", ") + ".";
+
+    if (successCount > 0) {
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            this,
+            "Conversion Complete",
+            QString("%1\n\nWould you like to open the output folder?").arg(summary),
+            QMessageBox::Yes | QMessageBox::No
+        );
+
+        if (reply == QMessageBox::Yes) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputPath));
+        }
+    } else {
+        QMessageBox::information(this, "Conversion Complete", summary);
     }
-    
+
     updateConvertButtonState();
 }
 
@@ -420,14 +546,40 @@ void MainWindow::onConversionError(const QString &filePath, const QString &error
     if (row != -1) {
         fileListTable->item(row, 3)->setText("✗ Error");
     }
+    failedCount++;
 
     statusBar()->showMessage(QString("Error: %1").arg(errorMessage));
+    updateProgressAfterItem();
 }
 
 void MainWindow::onFormatChanged(int index)
 {
     Q_UNUSED(index);
     updateConvertButtonState();
+}
+
+void MainWindow::onOpenPreferences()
+{
+    PreferencesDialog dialog(this);
+    dialog.setOutputDirectory(outputDirectory);
+    dialog.setRememberOutputDirectory(rememberOutputDirectory);
+    dialog.setJpgQuality(jpgQuality);
+    dialog.setMaxParallelConversions(maxParallelConversions);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    outputDirectory = dialog.outputDirectory();
+    rememberOutputDirectory = dialog.rememberOutputDirectory();
+    jpgQuality = dialog.jpgQuality();
+    maxParallelConversions = dialog.maxParallelConversions();
+
+    outputDirLabel->setText(outputDirectory);
+    converter->setJpgQuality(jpgQuality);
+    converter->setMaxParallelConversions(maxParallelConversions);
+
+    saveSettings();
 }
 
 void MainWindow::updateConvertButtonState()
@@ -557,39 +709,50 @@ void MainWindow::setupMenuBar()
     
     QAction *addFilesAction = fileMenu->addAction("&Add Files...");
     connect(addFilesAction, &QAction::triggered, this, &MainWindow::onAddFilesClicked);
-    
+
     fileMenu->addSeparator();
-    
+
+    // Qt relocates an action with PreferencesRole into the application menu on
+    // macOS automatically, regardless of which menu it's added to here.
+    QAction *preferencesAction = fileMenu->addAction("&Preferences...");
+    preferencesAction->setMenuRole(QAction::PreferencesRole);
+    preferencesAction->setShortcut(QKeySequence::Preferences);
+    connect(preferencesAction, &QAction::triggered, this, &MainWindow::onOpenPreferences);
+
+    fileMenu->addSeparator();
+
     QAction *exitAction = fileMenu->addAction("E&xit");
     connect(exitAction, &QAction::triggered, this, &QMainWindow::close);
     
-    // Integration menu (Windows Shell Integration)
+#ifdef Q_OS_WIN
+    // Integration menu (Windows Shell Integration) - Windows-only, no macOS equivalent yet
     QMenu *integrationMenu = menuBar->addMenu("&Integration");
-    
+
     // Context Menu submenu
     QMenu *contextMenuSubmenu = integrationMenu->addMenu("Context Menu");
-    
+
     installContextMenuAction = contextMenuSubmenu->addAction("&Install Context Menu");
     installContextMenuAction->setToolTip("Adds 'Convert with FileConverter' to right-click menu for supported file types");
     connect(installContextMenuAction, &QAction::triggered, this, &MainWindow::onInstallContextMenu);
-    
+
     removeContextMenuAction = contextMenuSubmenu->addAction("&Remove Context Menu");
     removeContextMenuAction->setToolTip("Removes the context menu entries (clean uninstall)");
     connect(removeContextMenuAction, &QAction::triggered, this, &MainWindow::onRemoveContextMenu);
-    
+
     integrationMenu->addSeparator();
-    
+
     // Send To submenu
     QMenu *sendToSubmenu = integrationMenu->addMenu("Send To Folder");
-    
+
     installSendToAction = sendToSubmenu->addAction("&Add to Send To");
     installSendToAction->setToolTip("Adds FileConverter to the 'Send To' right-click menu (safer alternative)");
     connect(installSendToAction, &QAction::triggered, this, &MainWindow::onInstallSendTo);
-    
+
     removeSendToAction = sendToSubmenu->addAction("&Remove from Send To");
     removeSendToAction->setToolTip("Removes FileConverter from the 'Send To' menu");
     connect(removeSendToAction, &QAction::triggered, this, &MainWindow::onRemoveSendTo);
-    
+#endif
+
     // Help menu
     QMenu *helpMenu = menuBar->addMenu("&Help");
     
@@ -606,22 +769,27 @@ void MainWindow::setupMenuBar()
             "<p>Version 1.0</p>");
     });
     
+#ifdef Q_OS_WIN
     // Update menu state based on current installation status
     updateIntegrationMenuState();
+#endif
 }
 
+#ifdef Q_OS_WIN
 void MainWindow::updateIntegrationMenuState()
 {
     bool shellInstalled = ContextMenu::isShellRegistered();
     bool sendToInstalled = ContextMenu::isSendToInstalled();
-    
+
     installContextMenuAction->setEnabled(!shellInstalled);
     removeContextMenuAction->setEnabled(shellInstalled);
-    
+
     installSendToAction->setEnabled(!sendToInstalled);
     removeSendToAction->setEnabled(sendToInstalled);
 }
+#endif
 
+#ifdef Q_OS_WIN
 void MainWindow::onInstallContextMenu()
 {
     if (ContextMenu::registerShellExtension()) {
@@ -667,11 +835,12 @@ void MainWindow::onInstallSendTo()
 void MainWindow::onRemoveSendTo()
 {
     if (ContextMenu::removeSendToShortcut()) {
-        QMessageBox::information(this, "Success", 
+        QMessageBox::information(this, "Success",
             "Send To shortcut removed!");
         updateIntegrationMenuState();
     } else {
-        QMessageBox::warning(this, "Error", 
+        QMessageBox::warning(this, "Error",
             "Failed to remove Send To shortcut.");
     }
 }
+#endif
