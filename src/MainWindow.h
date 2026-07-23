@@ -12,6 +12,8 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QCloseEvent>
+#include <QPoint>
 #include "Dropzone.h"
 #include "Converter.h"
 
@@ -22,9 +24,12 @@ class MainWindow : public QMainWindow
 public:
     MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
-    
+
     // Public method for adding files (used by main.cpp for context menu)
     void addFiles(const QStringList &filePaths);
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
 
 private slots:
     void onFilesDropped(const QStringList &filePaths);
@@ -39,13 +44,17 @@ private slots:
     void onAllConversionsFinished();
     void onFormatChanged(int index);
     void updateProgressTimer();
-    
-    // Integration menu slots
+    void onOpenPreferences();
+    void showFileListContextMenu(const QPoint &pos);
+
+#ifdef Q_OS_WIN
+    // Integration menu slots (Windows shell integration only)
     void onInstallContextMenu();
     void onRemoveContextMenu();
     void onInstallSendTo();
     void onRemoveSendTo();
     void updateIntegrationMenuState();
+#endif
 
 private:
     void setupUI();
@@ -56,6 +65,11 @@ private:
     bool canConvertToFormat(Converter::FileFormat sourceFormat, Converter::FileFormat targetFormat);
     QString formatElapsedTime(qint64 ms);
     QString formatRemainingTime(qint64 ms);
+    void startConversionBatch(const QStringList &filePaths, Converter::FileFormat targetFormat);
+    void retryRow(int row);
+    void updateProgressAfterItem();
+    void loadSettings();
+    void saveSettings();
 
     // UI Components
     Dropzone *dropzone;
@@ -78,15 +92,28 @@ private:
     int processedFiles;
     QString outputDirectory;
     QString lastOutputPath;
-    
+
+    // Per-batch outcome counts, used to build an accurate completion summary
+    int successCount = 0;
+    int failedCount = 0;
+    int unsupportedCount = 0;
+    int cancelledCount = 0;
+
+    // Persisted preferences
+    bool rememberOutputDirectory = false;
+    int jpgQuality = 90;
+    int maxParallelConversions = 1;
+
     // Progress timing
     QElapsedTimer elapsedTimer;
     QTimer *progressTimer;
     
-    // Integration menu
+#ifdef Q_OS_WIN
+    // Integration menu (Windows shell integration only)
     QAction *installContextMenuAction;
     QAction *removeContextMenuAction;
     QAction *installSendToAction;
     QAction *removeSendToAction;
+#endif
 };
 #endif // MAINWINDOW_H

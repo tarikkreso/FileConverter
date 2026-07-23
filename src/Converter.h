@@ -5,6 +5,7 @@
 #include <QString>
 #include <QProcess>
 #include <QMap>
+#include <QTimer>
 
 class Converter : public QObject
 {
@@ -46,6 +47,7 @@ public:
     void setImageMagickPath(const QString &path);
     void setMaxParallelConversions(int max);
     void setOutputDirectory(const QString &path);
+    void setJpgQuality(int quality);
 
 signals:
     void conversionStarted(const QString &filePath);
@@ -77,6 +79,9 @@ private:
     void convertDocumentToPDF(const QString &inputPath, const QString &outputPath);
     void convertPDFtoDocument(const QString &inputPath, const QString &outputPath, FileFormat targetFormat);
     void convertImage(const QString &inputPath, const QString &outputPath, FileFormat targetFormat);
+    void finishImageConversion(const QString &inputPath, const QString &outputPath, FileFormat sourceFormat, FileFormat targetFormat);
+    bool convertImageInProcess(const QString &inputPath, const QString &outputPath, FileFormat sourceFormat, FileFormat targetFormat);
+    void convertImageViaExternalTool(const QString &inputPath, const QString &outputPath);
     void startNextQueuedConversion();
     void scheduleFileCheck(const QString &inputPath, const QString &outputPath);
     void finalizeConversion();
@@ -86,6 +91,7 @@ private:
     QString libreOfficePath;
     QString imageMagickPath;
     QString outputDirectory;
+    int jpgQuality = 90;
     
     // Active conversions: key = inputPath
     QMap<QString, ConversionJob> activeJobs;

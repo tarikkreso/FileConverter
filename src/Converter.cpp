@@ -1,9 +1,12 @@
 #include "Converter.h"
+#include "ImageCodec.h"
 #include <QFileInfo>
 #include <QDir>
 #include <QStandardPaths>
 #include <QDebug>
 #include <QTimer>
+#include <QImage>
+#include <QFile>
 
 Converter::Converter(QObject *parent)
     : QObject(parent), maxParallelConversions(1)  // Use 1 to avoid LibreOffice conflicts
@@ -35,6 +38,11 @@ void Converter::setMaxParallelConversions(int max)
 void Converter::setOutputDirectory(const QString &path)
 {
     outputDirectory = path;
+}
+
+void Converter::setJpgQuality(int quality)
+{
+    jpgQuality = qBound(1, quality, 100);
 }
 
 bool Converter::isConverting() const
@@ -267,22 +275,138 @@ void Converter::convertPDFtoDocument(const QString &inputPath, const QString &ou
 
 void Converter::convertImage(const QString &inputPath, const QString &outputPath, FileFormat targetFormat)
 {
-    Q_UNUSED(targetFormat);
-    
+    FileFormat sourceFormat = detectFormat(inputPath);
+
+    // Track as a job (no external process) so cancellation/parallelism bookkeeping stays consistent.
+    ConversionJob job;
+    job.process = nullptr;
+    job.inputPath = inputPath;
+    job.outputPath = outputPath;
+    job.cancelled = false;
+    activeJobs[inputPath] = job;
+
+    // Defer the actual work to the next event loop iteration: keeps startNextQueuedConversion's
+    // loop from recursing into itself via finalizeConversion() for large in-process batches.
+    QTimer::singleShot(0, this, [this, inputPath, outputPath, sourceFormat, targetFormat]() {
+        finishImageConversion(inputPath, outputPath, sourceFormat, targetFormat);
+    });
+}
+
+void Converter::finishImageConversion(const QString &inputPath, const QString &outputPath, FileFormat sourceFormat, FileFormat targetFormat)
+{
+    bool cancelled = false;
+    if (activeJobs.contains(inputPath)) {
+        cancelled = activeJobs[inputPath].cancelled;
+        activeJobs.remove(inputPath);
+    }
+
+    if (cancelled) {
+        emit conversionFinished(inputPath, ConversionStatus::Cancelled, "");
+        finalizeConversion();
+        return;
+    }
+
+    if (convertImageInProcess(inputPath, outputPath, sourceFormat, targetFormat)) {
+        emit conversionFinished(inputPath, ConversionStatus::Success, outputPath);
+        finalizeConversion();
+        return;
+    }
+
+    if (imageMagickPath.isEmpty()) {
+        emit conversionError(inputPath,
+            "Could not convert this image without ImageMagick. Please install ImageMagick for additional format support.");
+        finalizeConversion();
+        return;
+    }
+
+    convertImageViaExternalTool(inputPath, outputPath);
+}
+
+bool Converter::convertImageInProcess(const QString &inputPath, const QString &outputPath, FileFormat sourceFormat, FileFormat targetFormat)
+{
+    QImage image;
+
+    switch (sourceFormat) {
+        case FileFormat::JPG:
+        case FileFormat::PNG:
+            if (!image.load(inputPath)) {
+                return false;
+            }
+            break;
+        case FileFormat::WEBP: {
+#ifdef HAVE_WEBP
+            QFile file(inputPath);
+            if (!file.open(QIODevice::ReadOnly)) {
+                return false;
+            }
+            if (!ImageCodec::decodeWebP(file.readAll(), image)) {
+                return false;
+            }
+            break;
+#else
+            return false;
+#endif
+        }
+        case FileFormat::HEIC: {
+#ifdef Q_OS_MACOS
+            if (!ImageCodec::decodeHeicMac(inputPath, image)) {
+                return false;
+            }
+            break;
+#else
+            return false;
+#endif
+        }
+        default:
+            return false;
+    }
+
+    if (image.isNull()) {
+        return false;
+    }
+
+    switch (targetFormat) {
+        case FileFormat::JPG:
+            return image.save(outputPath, "JPG", jpgQuality);
+        case FileFormat::PNG:
+            return image.save(outputPath, "PNG");
+        case FileFormat::WEBP: {
+#ifdef HAVE_WEBP
+            QByteArray encoded;
+            if (!ImageCodec::encodeWebP(image, encoded)) {
+                return false;
+            }
+            QFile out(outputPath);
+            if (!out.open(QIODevice::WriteOnly)) {
+                return false;
+            }
+            return out.write(encoded) == encoded.size();
+#else
+            return false;
+#endif
+        }
+        default:
+            return false;
+    }
+}
+
+void Converter::convertImageViaExternalTool(const QString &inputPath, const QString &outputPath)
+{
     if (imageMagickPath.isEmpty()) {
         emit conversionError(inputPath, "ImageMagick not found. Please install ImageMagick.");
+        finalizeConversion();
         return;
     }
 
     QProcess *process = new QProcess(this);
-    
+
     ConversionJob job;
     job.process = process;
     job.inputPath = inputPath;
     job.outputPath = outputPath;
     job.cancelled = false;
     activeJobs[inputPath] = job;
-    
+
     connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &Converter::onProcessFinished);
     connect(process, &QProcess::errorOccurred, this, &Converter::onProcessError);
@@ -473,12 +597,20 @@ void Converter::onProcessError(QProcess::ProcessError error)
 
 QString Converter::findLibreOffice()
 {
-    // Common LibreOffice installation paths on Windows
-    QStringList possiblePaths = {
-        "C:/Program Files/LibreOffice/program/soffice.exe",
-        "C:/Program Files (x86)/LibreOffice/program/soffice.exe",
-        QDir::homePath() + "/AppData/Local/Programs/LibreOffice/program/soffice.exe"
-    };
+    QStringList possiblePaths;
+
+#ifdef Q_OS_WIN
+    possiblePaths << "C:/Program Files/LibreOffice/program/soffice.exe"
+                  << "C:/Program Files (x86)/LibreOffice/program/soffice.exe"
+                  << QDir::homePath() + "/AppData/Local/Programs/LibreOffice/program/soffice.exe";
+#elif defined(Q_OS_MACOS)
+    possiblePaths << "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+                  << QDir::homePath() + "/Applications/LibreOffice.app/Contents/MacOS/soffice";
+#else
+    possiblePaths << "/usr/bin/soffice"
+                  << "/usr/lib/libreoffice/program/soffice"
+                  << "/opt/libreoffice/program/soffice";
+#endif
 
     for (const QString &path : possiblePaths) {
         if (QFileInfo::exists(path)) {
@@ -487,10 +619,16 @@ QString Converter::findLibreOffice()
     }
 
     // Try to find in PATH
+    const QString exeName =
+#ifdef Q_OS_WIN
+        "/soffice.exe";
+#else
+        "/soffice";
+#endif
     QString pathEnv = qEnvironmentVariable("PATH");
-    QStringList pathDirs = pathEnv.split(';', Qt::SkipEmptyParts);
+    QStringList pathDirs = pathEnv.split(QDir::listSeparator(), Qt::SkipEmptyParts);
     for (const QString &dir : pathDirs) {
-        QString sofficePath = dir + "/soffice.exe";
+        QString sofficePath = dir + exeName;
         if (QFileInfo::exists(sofficePath)) {
             return sofficePath;
         }
@@ -501,9 +639,9 @@ QString Converter::findLibreOffice()
 
 QString Converter::findImageMagick()
 {
-    // Common ImageMagick installation paths on Windows
     QStringList possiblePaths;
-    
+
+#ifdef Q_OS_WIN
     // Check Program Files directories
     QDir programFiles("C:/Program Files");
     QStringList imageMagickDirs = programFiles.entryList(QStringList() << "ImageMagick*", QDir::Dirs);
@@ -516,6 +654,15 @@ QString Converter::findImageMagick()
     for (const QString &dir : imageMagickDirs) {
         possiblePaths << "C:/Program Files (x86)/" + dir + "/magick.exe";
     }
+#elif defined(Q_OS_MACOS)
+    // Homebrew (Apple Silicon and Intel default prefixes) and MacPorts
+    possiblePaths << "/opt/homebrew/bin/magick"
+                  << "/usr/local/bin/magick"
+                  << "/opt/local/bin/magick";
+#else
+    possiblePaths << "/usr/bin/magick"
+                  << "/usr/local/bin/magick";
+#endif
 
     for (const QString &path : possiblePaths) {
         if (QFileInfo::exists(path)) {
@@ -524,10 +671,16 @@ QString Converter::findImageMagick()
     }
 
     // Try to find in PATH
+    const QString exeName =
+#ifdef Q_OS_WIN
+        "/magick.exe";
+#else
+        "/magick";
+#endif
     QString pathEnv = qEnvironmentVariable("PATH");
-    QStringList pathDirs = pathEnv.split(';', Qt::SkipEmptyParts);
+    QStringList pathDirs = pathEnv.split(QDir::listSeparator(), Qt::SkipEmptyParts);
     for (const QString &dir : pathDirs) {
-        QString magickPath = dir + "/magick.exe";
+        QString magickPath = dir + exeName;
         if (QFileInfo::exists(magickPath)) {
             return magickPath;
         }
